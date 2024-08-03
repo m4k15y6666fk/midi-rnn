@@ -1,0 +1,617 @@
+---
+title: MIDI RNN
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .qmd
+      format_name: quarto
+      format_version: '1.0'
+      jupytext_version: 1.16.3
+  kernelspec:
+    display_name: Julia 1.6.7
+    language: julia
+    name: julia-1.6
+---
+
+
+## 準備
+
+
+```{julia}
+isfile("data/input.mid") || download(
+    "https://midi-db.pages.dev/VIPRPG%E3%83%84%E3%82%AF%E3%83%BC%E3%83%AB%E3%82%B9%E3%83%AC%E7%B4%A0%E6%9D%90%E4%BF%9D%E7%AE%A1%E5%BA%AB(1%E4%BB%A3%E7%9B%AE)/sozai3/shk_mid_421.mid",
+    "data/input.mid"
+)
+```
+
+```{julia}
+import MIDI
+
+midi = MIDI.load("data/input.mid")
+```
+
+```{julia}
+midi.tracks
+```
+
+```{julia}
+_merge_tracks = map([2, 3]) do v
+    return midi.tracks[v]
+end
+```
+
+```{julia}
+@show track = MIDI.MIDITrack()
+
+for _track in _merge_tracks
+    notes = MIDI.getnotes(_track, midi.tpq)
+    @show notes
+
+    MIDI.addnotes!(track, notes)
+end
+
+@show track
+
+_notes = MIDI.getnotes(track, midi.tpq)
+```
+
+```{julia}
+import MusicManipulations as MM
+
+@show grid = 0:1//8:1
+
+_notes32 = MM.quantize(_notes, grid)
+```
+
+```{julia}
+@show _ticks_per_bars = midi.tpq * 4 # ticks per bars
+@show _ticks_per_32 = midi.tpq * 4 ÷ 32 # ticks per 1/32 notes
+```
+
+```{julia}
+_relative_notes = [ (ni.pitch, (ni.position - _notes32[begin].position), ((ni.position % _ticks_per_bars) / _ticks_per_32), ni.duration) .|> Int64 for (i, ni) in enumerate(_notes32) ]
+
+# each : (pitch, absolute position, position in bar, duration)
+```
+
+```{julia}
+_positions32 = vcat(
+    [0],
+    [ _ri[2] for _ri in _relative_notes ]
+)
+```
+
+```{julia}
+relative_notes = [ ( _ri[1], _ri[2] - _positions32[i], _ri[3], _ri[4] ) for (i, _ri) in enumerate(_relative_notes) ]
+
+# each : (pitch, step, position in bar, duration)
+```
+
+```{julia}
+import JLD2
+
+JLD2.jldsave("data/input.jld2"; notes = relative_notes)
+```
+
+## データセットの作成
+
+```{julia}
+import JLD2
+
+relative_notes = JLD2.load("data/input.jld2", "notes")
+```
+
+```{julia}
+uniq_pitch = [ ri[1] for ri in relative_notes ] |> Set |> collect |> sort
+```
+
+```{julia}
+uniq_step = [ ri[2] for ri in relative_notes ] |> Set |> collect |> sort
+```
+
+```{julia}
+@assert (filter(uniq_step .% _ticks_per_32) do v
+    v != 0
+end |> length) == 0
+```
+
+```{julia}
+uniq_position = [ ri[3] for ri in relative_notes ] |> Set |> collect |> sort
+```
+
+```{julia}
+uniq_duration = [ ri[4] for ri in relative_notes ] |> Set |> collect |> sort
+```
+
+```{julia}
+@assert (uniq_pitch |> length) < 100
+@assert (uniq_step |> length) < 100
+@assert (uniq_position |> length) < 100
+@assert (uniq_duration |> length) < 100
+```
+
+```{julia}
+idx2pitch = uniq_pitch
+pitch2idx = Dict([ (ui, i) for (i, ui) in enumerate(idx2pitch) ])
+@show pitch2idx |> summary
+
+idx2step = uniq_step
+step2idx = Dict([ (ui, i) for (i, ui) in enumerate(idx2step) ])
+@show step2idx |> summary
+
+idx2position = uniq_position
+position2idx = Dict([ (ui, i) for (i, ui) in enumerate(idx2position) ])
+@show position2idx |> summary
+
+idx2duration = uniq_duration
+duration2idx = Dict([ (ui, i) for (i, ui) in enumerate(idx2duration) ])
+@show duration2idx |> summary
+```
+
+```{julia}
+@show L_pi = uniq_pitch |> length
+@show L_s = uniq_step |> length
+@show L_po = uniq_position |> length
+@show L_d = uniq_duration |> length
+
+function note2idx(note)
+    return pitch2idx[note[1]], step2idx[note[2]], position2idx[note[3]], duration2idx[note[4]]
+end
+
+function idx2note(t)
+    return idx2pitch[t[1]], idx2step[t[2]], idx2position[t[3]], idx2duration[t[4]]
+end
+
+function note_idx2int(t)
+    return t[4] + ( t[3] * 100 ) + ( t[2] * 100_00 ) + ( t[1] * 100_00_00 )
+end
+
+function int2note_idx(int)
+    duration = int % 100
+    position = ( int ÷ 100 ) % 100
+    step = ( int ÷ 100_00 ) % 100
+    pitch = int ÷ 100_00_00
+    
+    return pitch, step, position, duration
+end
+```
+
+```{julia}
+@show n = rand(relative_notes, 1) |> first
+
+@show a = note2idx(n)
+@show b = note_idx2int(a)
+@show c = int2note_idx(b)
+
+@show idx2note(c)
+```
+
+```{julia}
+relative_int = relative_notes .|> note2idx .|> note_idx2int
+```
+
+```{julia}
+function split_expect(data)
+    n = data .|> int2note_idx
+    return (
+        [ ni[1] for ni in n ], # pitch
+        [ ni[2] for ni in n ], # step
+        [ ni[3] for ni in n ], # position
+        [ ni[4] for ni in n ]  # duration
+    )
+end
+```
+
+```{julia}
+using Flux
+
+_sequence_length = 128
+@show relative_notes |> length |> x -> x / _sequence_length
+
+
+dataset_input = Flux.chunk(relative_int[begin:(end - 1)]; size = _sequence_length)
+dataset_expect = Flux.chunk(relative_int[(begin + 1):end]; size = _sequence_length)
+@show dataset_input |> size
+@show dataset_expect |> size
+
+dataset_input = filter(x -> length(x) == _sequence_length, dataset_input)
+dataset_expect = filter(x -> length(x) == _sequence_length, dataset_expect)
+@show dataset_input |> size
+@show dataset_expect |> size
+```
+
+```{julia}
+using Flux
+
+@show Flux.batchseq(dataset_input) |> summary
+```
+
+## 学習 / Training
+
+```{julia}
+using Flux
+
+# custom join layer
+struct Join{T, F}
+    combine::F
+    paths::T
+end
+
+# allow Join(op, m1, m2, ...) as a constructor
+Join(combine, paths...) = Join(combine, paths)
+
+Flux.@functor Join
+
+
+(m::Join)(xs::Tuple) = m.combine(map((f, x) -> f(x), m.paths, xs)...)
+# (m::Join)(xs...) = m(xs)
+
+(m::Join)(xs::Vector) = hcat([ m(xsi) for xsi in xs ]...)
+(m::Join)(xs::Int) = m( int2note_idx(xs) )
+```
+
+```{julia}
+e1 = Flux.Embedding(L_pi => 2)
+e2 = Flux.Embedding(L_s => 5)
+e3 = Flux.Embedding(L_po => 3)
+e4 = Flux.Embedding(L_d => 1)
+
+j = Join(
+    vcat,
+    e1,
+    e2,
+    e3,
+    e4
+)
+
+@show v = rand(relative_int, 2)
+
+@show v[1] |> int2note_idx |> x -> ( e1(x[1]), e2(x[2]), e3(x[3]), e4(x[4]) )
+@show v[2] |> int2note_idx |> x -> ( e1(x[1]), e2(x[2]), e3(x[3]), e4(x[4]) )
+
+
+j([ v[1], v[2] ])
+```
+
+```{julia}
+@show 128 + 32 + 96 + 128
+```
+
+```{julia}
+L_pi = uniq_pitch |> length
+L_s = uniq_step |> length
+L_po = uniq_position |> length
+L_d = uniq_duration |> length
+
+function build_model()
+    rne = Join(
+        vcat,
+        Flux.Embedding(L_pi => 128),
+        Flux.Embedding(L_s => 32),
+        Flux.Embedding(L_po => 96),
+        Flux.Embedding(L_d => 128)
+    )
+
+    return Flux.Chain(
+        rne,
+        Flux.LSTM(384 => 384),
+        Flux.LayerNorm(384),
+        Flux.LSTM(384 => 384),
+        Flux.LayerNorm(384),
+        Flux.Dense(384 => (L_pi + L_s + L_d)),
+        Flux.AlphaDropout(0.1)
+    )
+end
+
+function split_predict(mat)
+    R_pi = 1:L_pi
+    R_s = (L_pi + 1):(L_pi + L_s)
+    R_d = (L_pi + L_s + 1):(L_pi + L_s + L_d)
+
+    return mat[R_pi, :, :], mat[R_s, :, :], mat[R_d, :, :]
+end
+```
+
+関数 `build_model()` のチェック
+
+```{julia}
+model = build_model()
+Flux.testmode!(model)
+
+@show v = rand(relative_int, 4)
+
+model(v) |> split_predict .|> summary
+```
+
+```{julia}
+import JLD2
+
+function load_checkpoint(f)
+    if isfile(f)
+        m = build_model()
+        e, s = JLD2.load(f, "epoch", "model_state")
+
+        Flux.reset!(m)
+        # Flux.reset!(s)
+
+        # m |> summary |> println
+
+        # Flux.state(m) |> summary |> println
+        # s |> summary |> println
+
+        Flux.loadmodel!(m, s)
+
+        return e, m
+    end
+
+    return 0, ()
+end
+```
+
+```{julia}
+import JLD2
+
+function save_checkpoint(m; filename = "midi-rnn-model-checkpoint", epoch = 0)
+    filename isa String || error("$(filename) is not String")
+
+    Flux.reset!(m)
+    JLD2.jldsave(filename * ".jld2"; epoch, model_state = Flux.state(m))
+end
+```
+
+### 学習ループ / Training Loop
+
+学習時のみ実行
+
+```{julia}
+# support for LSTM model
+#
+epoch_done, model = load_checkpoint("midi-rnn-model-checkpoint.jld2")
+```
+
+```{julia}
+# New model
+#
+epoch_done, model = 0, build_model()
+```
+
+```{julia}
+using Flux
+
+Flux.trainmode!(model)
+opt = Flux.setup(Flux.Adam(), model)
+```
+
+```{julia}
+using Flux
+import Statistics
+
+
+num_epoch = 50
+
+loader = Flux.DataLoader((dataset_input, dataset_expect); batchsize = 4, buffer = true, partial = false, shuffle = true)
+
+global step = 0
+for epoch in (epoch_done + 1):(epoch_done + num_epoch)
+    println("[ Epoch ", epoch, " ]")
+
+    global step = 0
+    Flux.train!(model, loader, opt) do m, x, y
+        global step += 1
+
+        Flux.reset!(m)
+
+        bx = Flux.batchseq(x)
+        by = Flux.batchseq(y)
+        # @show bx |> summary
+
+
+        _predict = [ m(bxi) for bxi in bx ] |> x -> cat(x...; dims = 3)
+        # @show _predict |> summary
+
+        predict_pitch, predict_step, predict_duration = _predict |> split_predict
+        # @show (predict_pitch, predict_step, predict_position, predict_duration) .|> summary
+
+
+        _expect = hcat(by...)
+        # @show _expect |> summary
+
+        expect_pitch, expect_step, _, expect_duration = _expect |> split_expect
+        # @show (expect_pitch, expect_step, expect_duration) .|> summary
+
+        expect_pitch_oh = Flux.onehotbatch(expect_pitch, 1:L_pi)
+        expect_step_oh = Flux.onehotbatch(expect_step, 1:L_s)
+        # expect_position_oh = Flux.onehotbatch(expect_position, 1:L_po)
+        expect_duration_oh = Flux.onehotbatch(expect_duration, 1:L_d)
+        # @show (expect_pitch_oh, expect_step_oh, expect_position_oh, expect_duration_oh) .|> summary
+
+
+        _loss_pitch = Flux.logitcrossentropy(predict_pitch, expect_pitch_oh)
+        _loss_step = Flux.logitcrossentropy(predict_step, expect_step_oh)
+        _loss_duration = Flux.logitcrossentropy(predict_duration, expect_duration_oh)
+
+        _loss = Statistics.mean([ _loss_pitch, _loss_step, _loss_duration ])
+
+
+        # _acc = Statistics.mean(Flux.onecold(prediction, 1:65) .== y)
+
+        print("\r", "step : ", step, " | loss : ", _loss) #, " | acc : ", _acc)
+
+        # error("error")
+
+        return _loss
+    end
+
+    println("")
+
+    print("Saving model checkpoint...")
+    save_checkpoint(model; epoch)
+    println(" Done.")
+end
+```
+
+## 生成 / Generate
+
+```{julia}
+# epoch_done, model = 0, build_model()
+
+@show epoch_done, model = load_checkpoint("midi-rnn-model-checkpoint.jld2")
+Flux.testmode!(model)
+```
+
+```{julia}
+function idx2note_without_position(t)
+    return idx2pitch[t[1]], idx2step[t[2]], idx2duration[t[3]]
+end
+
+function add_position(note; prev = (0, 0, 0, 0))
+    if (note[2] % _ticks_per_32 != 0)
+        error("$(note[2]) % 48 != 0")
+    end
+
+    return (
+        note[1],
+        note[2],
+        ( prev[3] + (note[2] ÷ _ticks_per_32) ) % 32,
+        note[3]
+    )
+end
+```
+
+```{julia}
+using Flux
+import Distributions
+
+function categorical_sample(p; temperature = 1.0)
+    _p = p ./ temperature |> Flux.softmax
+    _d = Distributions.Categorical(_p)
+
+    return rand(_d, 1)[begin]
+end
+```
+
+```{julia}
+import MIDI
+
+function generate_notes(init_notes; tpq = 960, qpm = 120, generate_seconds = 60, max_length = 65533, temperature = 1.0)
+    Flux.reset!(model)
+
+
+    init_notes isa Vector{NTuple{4, Int}} || error("Not supported type: $( typeof(init_notes) )")
+
+    _result = init_notes
+
+
+    if length(init_notes) > 1
+        for c in ( init_notes[begin:(end - 1)] .|> note2idx .|> note_idx2int )
+            model([ c ])
+        end
+    end
+    _input = ( _result[end:end] .|> note2idx .|> note_idx2int )
+    _predict_distributions = ( _input |> model |> split_predict )
+
+    _predict_note_idx = ( _predict_distributions .|> x -> categorical_sample(reshape(x, :)) )
+    _predict_note = ( _predict_note_idx |> idx2note_without_position )
+    _predict_note_with_position = add_position(_predict_note; prev = _result[end])
+
+    # @show _result[end]
+    push!(_result, _predict_note_with_position)
+
+    for i in 1:max_length
+        _input = ( _result[end:end] .|> note2idx .|> note_idx2int )
+
+        _predict_distributions = ( _input |> model |> split_predict )
+
+        _predict_note_idx = ( _predict_distributions .|> x -> categorical_sample(reshape(x, :)) )
+        _predict_note = ( _predict_note_idx |> idx2note_without_position )
+        _predict_note_with_position = add_position(_predict_note; prev = _result[end])
+
+        # @show _result[end]
+        push!(_result, _predict_note_with_position)
+
+
+        _total_ticks = sum(_result .|> v -> v[2])
+        _total_ms = _total_ticks * MIDI.ms_per_tick(tpq, qpm)
+
+        if _total_ms >= (generate_seconds * 1000)
+            break
+        end
+    end
+
+    return _result
+end
+```
+
+### MIDI の生成 / Generating MIDI
+
+MIDI 生成をするためには、以下のセルを順番に実行
+
+```{julia}
+@show _init = rand(relative_notes, 1)[begin]
+
+init = [ (_init[1], 0, _init[3], _init[4]) ]
+```
+
+```{julia}
+new_relative_notes = generate_notes(init; tpq = midi.tpq, qpm = 80, generate_seconds = 600)
+```
+
+```{julia}
+import MIDI
+
+_note_vector = [
+    MIDI.Note(ri[1], ( ri[2] + sum(new_relative_notes[1:(i - 1)] .|> v -> v[2]) + (new_relative_notes[begin][3] * _ticks_per_32) ); duration = ri[4])
+    for (i, ri) in enumerate(new_relative_notes)
+]
+```
+
+```{julia}
+using Flux
+
+import MIDI
+import MusicManipulations as MM
+
+
+function save_midi_file(filename, note_vector; tpq = 960, qpm = 120, humanize = true, chunk_size = 2048)
+    filename isa String || error("Not support filename type: $( typeof(filename) )")
+    note_vector isa Vector{MIDI.Note} || error("Not support filename type: $( typeof(note_vector) )")
+
+    _micro_sec_per_q = (( 60 / qpm ) * ( 10 ^ 6 )) |> floor |> Int
+    _set_tempo_event = MIDI.SetTempoEvent(0, 0x51, _micro_sec_per_q)
+
+    _tempo_track = MIDI.MIDITrack()
+    MIDI.addevent!(_tempo_track, 0, _set_tempo_event)
+
+
+    _notes_track = MIDI.MIDITrack()
+
+    for vi in Flux.chunk(_note_vector; size = chunk_size)
+        # @show vi
+        _notes = MIDI.Notes(vi |> collect, tpq)
+    
+        !!humanize && MM.humanize!(_notes, :position, 40)    
+        MIDI.addnotes!(_notes_track, _notes)
+    end
+
+
+    _file = MIDI.MIDIFile(1, tpq, [ _tempo_track, _notes_track ])
+
+    MIDI.save(filename, _file)
+
+    @info "Saving MIDI data to $( filename ) is completed."
+
+
+    return true
+end
+```
+
+```{julia}
+import Dates
+
+_sample_file_name = Dates.now() |> d -> begin
+    return ( "output/" * Dates.format(d, Dates.DateFormat("yyyymmdd-HHMMSS-sss")) * ".mid" )
+end
+
+save_midi_file(_sample_file_name, _note_vector; tpq = midi.tpq, qpm = 80)
+```
+

@@ -1,0 +1,2 @@
+# Pair ipynb notebooks to qmd:quarto text
+formats = "ipynb,qmd:quarto"
