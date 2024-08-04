@@ -13,14 +13,34 @@ jupyter:
     name: julia-1.6
 ---
 
+```{julia}
+import Dates
 
-## 準備
+d = Dates.now()
 
+"Copyright © " * "2024 - " * Dates.format(d, Dates.DateFormat("yyyy")) * " hiiro" * "\n" |> println
+"This notebook is licensed under MIT License." * "\n" |> println
+"Last Updated: " * ( d |> string ) |> println
+```
+
+# MIDI RNN
+
+1. 準備
+2. 学習
+3. 生成
+
+## 準備 / Preparation
 
 ```{julia}
-isfile("data/input.mid") || download(
+_input_midi = "data/input.mid"
+```
+
+```{julia}
+_input_midi isa String || error("Not supported type: $( typeof(_input_midi) )")
+
+isfile(_input_midi) || download(
     "https://midi-db.pages.dev/VIPRPG%E3%83%84%E3%82%AF%E3%83%BC%E3%83%AB%E3%82%B9%E3%83%AC%E7%B4%A0%E6%9D%90%E4%BF%9D%E7%AE%A1%E5%BA%AB(1%E4%BB%A3%E7%9B%AE)/sozai3/shk_mid_421.mid",
-    "data/input.mid"
+    _input_midi
 )
 ```
 
@@ -56,6 +76,15 @@ _notes = MIDI.getnotes(track, midi.tpq)
 ```
 
 ```{julia}
+import Plots
+
+Plots.histogram(
+    [ ni.pitch % 12 for ni ∈ _notes ],
+    bins = range(0, 11; step = 1)
+)
+```
+
+```{julia}
 import MusicManipulations as MM
 
 @show grid = 0:1//8:1
@@ -88,9 +117,14 @@ relative_notes = [ ( _ri[1], _ri[2] - _positions32[i], _ri[3], _ri[4] ) for (i, 
 ```
 
 ```{julia}
-import JLD2
+import MIDI, JLD2
 
-JLD2.jldsave("data/input.jld2"; notes = relative_notes)
+JLD2.jldsave(
+    "data/input.jld2";
+    tpq = midi.tpq,
+    qpm = ( MIDI.qpm(midi) |> round |> Int ),
+    notes = relative_notes
+)
 ```
 
 ## データセットの作成
@@ -98,29 +132,25 @@ JLD2.jldsave("data/input.jld2"; notes = relative_notes)
 ```{julia}
 import JLD2
 
-relative_notes = JLD2.load("data/input.jld2", "notes")
+_tpq, _qpm, relative_notes = JLD2.load("data/input.jld2", "tpq", "qpm", "notes")
+
+relative_notes
 ```
 
 ```{julia}
-uniq_pitch = [ ri[1] for ri in relative_notes ] |> Set |> collect |> sort
+function classify_notes(notes)
+    return  [ [ ni[i] for ni ∈ notes ] for i ∈ 1:4 ] .|> Set .|> collect .|> sort # .|> summary
+end
 ```
 
 ```{julia}
-uniq_step = [ ri[2] for ri in relative_notes ] |> Set |> collect |> sort
+@show uniq_pitch, uniq_step, uniq_position, uniq_duration = classify_notes(relative_notes)
 ```
 
 ```{julia}
-@assert (filter(uniq_step .% _ticks_per_32) do v
+@assert (filter(uniq_step .% (_tpq ÷ 8)) do v
     v != 0
 end |> length) == 0
-```
-
-```{julia}
-uniq_position = [ ri[3] for ri in relative_notes ] |> Set |> collect |> sort
-```
-
-```{julia}
-uniq_duration = [ ri[4] for ri in relative_notes ] |> Set |> collect |> sort
 ```
 
 ```{julia}
@@ -129,6 +159,30 @@ uniq_duration = [ ri[4] for ri in relative_notes ] |> Set |> collect |> sort
 @assert (uniq_position |> length) < 100
 @assert (uniq_duration |> length) < 100
 ```
+
+### 各クラス分けの確認
+
+実行は必須ではない。確認用。
+
+```{julia}
+uniq_pitch
+```
+
+```{julia}
+uniq_step
+```
+
+```{julia}
+uniq_position
+```
+
+```{julia}
+uniq_duration
+```
+
+### OneHot 変換
+
+実行は必須。
 
 ```{julia}
 idx2pitch = uniq_pitch
@@ -185,6 +239,10 @@ end
 
 @show idx2note(c)
 ```
+
+### 学習のための準備
+
+学習しないなら実行は必要なし。
 
 ```{julia}
 relative_int = relative_notes .|> note2idx .|> note_idx2int
@@ -465,6 +523,8 @@ function idx2note_without_position(t)
 end
 
 function add_position(note; prev = (0, 0, 0, 0))
+    _ticks_per_32 = _tpq ÷ 8
+
     if (note[2] % _ticks_per_32 != 0)
         error("$(note[2]) % 48 != 0")
     end
@@ -553,14 +613,14 @@ init = [ (_init[1], 0, _init[3], _init[4]) ]
 ```
 
 ```{julia}
-new_relative_notes = generate_notes(init; tpq = midi.tpq, qpm = 80, generate_seconds = 600)
+new_relative_notes = generate_notes(init; tpq = _tpq, qpm = _qpm, generate_seconds = 600)
 ```
 
 ```{julia}
 import MIDI
 
 _note_vector = [
-    MIDI.Note(ri[1], ( ri[2] + sum(new_relative_notes[1:(i - 1)] .|> v -> v[2]) + (new_relative_notes[begin][3] * _ticks_per_32) ); duration = ri[4])
+    MIDI.Note(ri[1], ( ri[2] + sum(new_relative_notes[1:(i - 1)] .|> v -> v[2]) + (new_relative_notes[begin][3] * (_tpq ÷ 8)) ); duration = ri[4])
     for (i, ri) in enumerate(new_relative_notes)
 ]
 ```
@@ -581,6 +641,7 @@ function save_midi_file(filename, note_vector; tpq = 960, qpm = 120, humanize = 
 
     _tempo_track = MIDI.MIDITrack()
     MIDI.addevent!(_tempo_track, 0, _set_tempo_event)
+    MIDI.addtrackname!(_tempo_track, "Tempo")
 
 
     _notes_track = MIDI.MIDITrack()
@@ -592,6 +653,10 @@ function save_midi_file(filename, note_vector; tpq = 960, qpm = 120, humanize = 
         !!humanize && MM.humanize!(_notes, :position, 40)    
         MIDI.addnotes!(_notes_track, _notes)
     end
+    MIDI.addtrackname!(_notes_track, "Piano")
+
+    _instrument_event = MIDI.InstrumentNameEvent(0, 0x04, "piano")
+    MIDI.addevent!(_notes_track, 0, _instrument_event)
 
 
     _file = MIDI.MIDIFile(1, tpq, [ _tempo_track, _notes_track ])
@@ -612,6 +677,6 @@ _sample_file_name = Dates.now() |> d -> begin
     return ( "output/" * Dates.format(d, Dates.DateFormat("yyyymmdd-HHMMSS-sss")) * ".mid" )
 end
 
-save_midi_file(_sample_file_name, _note_vector; tpq = midi.tpq, qpm = 80)
+save_midi_file(_sample_file_name, _note_vector; tpq = _tpq, qpm = _qpm)
 ```
 
