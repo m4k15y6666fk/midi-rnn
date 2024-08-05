@@ -9,16 +9,25 @@ MIDI generator with RNN. Execute with IJulia Notebook (.qmd : Quarto Format)
 
 ## インストール
 
+Linux 環境へのインストール詳細については後日追記予定（macOS に付いての記述を参照）
+
 ### macOS
 
 #### 1. 事前準備
 
-* Python 3.12.x
-* Julia 1.6.x
+* Python 3.12.4
+* Quarto 1.5.54
+* Julia 1.6.7
 
 ##### Homebrew
 
 事前に Homebrew (`brew` コマンド) をインストールする。
+
+##### Quarto
+
+```bash
+brew install --cask quarto
+```
 
 ##### Miniconda / venv
 
@@ -30,7 +39,7 @@ conda または venv で Python の仮想環境を構築する：
 conda create --name [jupyter 環境の名前] python=3.12
 ```
 
-#### 2. Jupyter Lab 
+#### 2. Jupyter Lab と Jupytext のインストール
 
 ```bash
 conda activate [jupyter 環境の名前]
@@ -116,5 +125,9 @@ cd midi-rnn
 ### 7. Jupyter Lab の起動
 
 ```bash
+jupytext --output my-original.ipynb midi-rnn.qmd
+
 jupyter lab --notebook-dir=.
 ```
+
+

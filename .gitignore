@@ -6,16 +6,20 @@ output/*
 
 
 *.jld2
-!midi-*.jld2
+!midi-rnn-*.jld2
 
 *.qmd
-!midi-*.qmd
+!midi-rnn.qmd
 
 *.backup
-!midi-*.backup
+!midi-rnn-*.backup
 
 
 *.ipynb
 
 .ipynb_checkpoints
 */**/.ipynb_checkpoints
+
+
+!data/input.jld2
+!data/input.jld2.backup
